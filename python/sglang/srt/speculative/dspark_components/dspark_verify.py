@@ -29,6 +29,9 @@ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_hidden_lag_cache import (
+    TargetHiddenLagCache,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -75,6 +78,7 @@ class TargetVerifyExecutor:
         verify_num_draft_tokens: int,
         model_runner,
         kv_injector: TargetHiddenKvInjector,
+        hidden_lag_cache: TargetHiddenLagCache,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
     ) -> None:
@@ -83,6 +87,7 @@ class TargetVerifyExecutor:
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
         self.kv_injector = kv_injector
+        self._hidden_lag_cache = hidden_lag_cache
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
@@ -309,6 +314,12 @@ class TargetVerifyExecutor:
         if hidden is None:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
+        if self._hidden_lag_cache.enabled:
+            # Stale-hidden ablation: swap the fresh target hidden for one lagged
+            # by lag_steps decode steps, injected at THIS step's positions
+            # (value-stale). No-op when disabled -> depth-0 parity.
+            self._hidden_lag_cache.snapshot(batch=batch, fresh_hidden=hidden)
+            hidden = self._hidden_lag_cache.get_lagged(batch=batch, fresh_hidden=hidden)
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_window.verify_cache_loc,

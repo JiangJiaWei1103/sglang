@@ -37,6 +37,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
+from sglang.srt.speculative.dspark_components.dspark_hidden_lag_cache import (
+    TargetHiddenLagCache,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -247,12 +250,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
+        self._hidden_lag_cache = TargetHiddenLagCache(
+            lag_steps=envs.SGLANG_DSPARK_TARGET_HIDDEN_LAG_STEPS.get()
+        )
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self.target_worker,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
+            hidden_lag_cache=self._hidden_lag_cache,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
         )
@@ -380,6 +387,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+        if self._hidden_lag_cache.enabled:
+            self._hidden_lag_cache.evict(rid=rid)
 
     def forward_batch_generation(
         self,

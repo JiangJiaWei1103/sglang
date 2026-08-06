@@ -910,6 +910,10 @@ class Envs:
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Stale-hidden ablation: feed the draft a target hidden lagged by N decode
+    # steps (0 = fresh/vanilla) to measure accept-length drop under staleness
+    # (parallel-DSpark go/no-go). Consumed by TargetHiddenLagCache.
+    SGLANG_DSPARK_TARGET_HIDDEN_LAG_STEPS = EnvInt(0)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
