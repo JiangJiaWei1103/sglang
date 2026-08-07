@@ -251,7 +251,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         self._hidden_lag_cache = TargetHiddenLagCache(
-            lag_steps=envs.SGLANG_DSPARK_TARGET_HIDDEN_LAG_STEPS.get()
+            lag_steps=envs.SGLANG_DSPARK_TARGET_HIDDEN_LAG_STEPS.get(),
+            fill_mode=envs.SGLANG_DSPARK_STALE_FILL_MODE.get(),
         )
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self.target_worker,
@@ -730,7 +731,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
-            new_seq_lens=accept.new_seq_lens,
+            new_seq_lens=accept.new_seq_lenscap_trim_lens,
         )
         return GenerationBatchResult(
             logits_output=logits_output,

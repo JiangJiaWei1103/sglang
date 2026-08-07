@@ -8,30 +8,48 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class TargetHiddenLagCache:
-    """Feeds the draft a *stale* target hidden -- one lagged by ``lag_steps``
-    decode steps instead of the fresh one -- so we can measure how much accept
-    length degrades under staleness (the parallel-DSpark go/no-go ablation).
+    """Simulate a drafter running ``lag_steps`` rounds AHEAD of the verifier, the
+    way parallel DSpark actually behaves, so we can measure the accept-len drops.
 
-    ``lag_steps == 0`` is the identity / vanilla case: ``enabled`` is False and
-    the cache is never touched, so the default DSpark path is byte-identical and
-    pays zero overhead. ``lag_steps >= 1`` turns the ablation on.
+    BACKFILL: every committed position eventually holds its real target hidden;
+    injected ``lag_steps`` rounds later.
+    FRONTIER: at any draft the last ``lag_steps`` rounds' just-committed positions
+    have no real hidden; they get a FILL until the real one arrives ``lag_steps``
+    rounds later and overwrites it.
 
-    Sits next to the injection seam (``TargetVerifyExecutor.commit_hidden``): the
-    caller snapshots this step's fresh hidden, then swaps in the lagged one right
-    before ``inject_target_hidden`` writes it into the draft KV pool.
+    Previous impl overwrote every position with a stale hidden and NEVER backfilled.
 
-    Wiring (env var, object, three call sites) guarantees depth-0 parity; the
-    method bodies implement per-request keyed staleness -- keyed by ``rid``,
-    which survives the batch reordering that continuous batching causes (the Q3
-    gate) -- with a fresh fallback during each request's cold-start rounds.
+    ``lag_steps == 0`` -> ``enabled`` is False; commit_hidden keeps the stock
+    fresh injection (byte-identical vanilla). ``lag_steps >= 1`` turns it on.
+
+    ``fill_mode`` -- what fills the transient frontier hole:
+      * ``"repeat"``  : the last REAL target hidden (h at the last verified
+        position) broadcast across the frontier. Still a content-phase mismatch,
+        but TRANSIENT + frontier-only (much milder than variant A).
+      * ``"gap"``     : nothing / no rows. NOT WIRED here -- a skipped write leaves
+        garbage in the reused slot; true "no rows" needs the draft attention to
+        exclude un-injected positions (a masking change), which this seam can't do.
+      * ``"self_kv"`` : the draft's own K/V. NOT WIRED -- this seam doesn't hold
+        the draft-side K/V.
+
+    Per-request keyed (``rid``) so it survives batch reordering. Each request's
+    first ``lag_steps`` rounds inject fresh (cold start ~ synced start).
     """
 
-    def __init__(self, *, lag_steps: int) -> None:
+    _FILL_MODES = ("repeat", "gap", "self_kv")
+
+    def __init__(self, *, lag_steps: int, fill_mode: str = "repeat") -> None:
         self._lag_steps = int(lag_steps)
-        # Per-request store of recent fresh-hidden snapshots. Step 2 decides the
-        # KEY (Q3: what identifies "the same request" across steps whose batch
-        # rows are reordered as requests finish/join) and the ring structure.
-        self._store: dict = {}
+        if fill_mode not in self._FILL_MODES:
+            raise ValueError(
+                f"unknown fill_mode {fill_mode!r}; expected one of {self._FILL_MODES}"
+            )
+        self._fill_mode = fill_mode
+        # rid -> deque(maxlen lag+1) of one round's
+        # (hidden [W,H], cache_loc [W], positions [W], commit_lens [1], commit_len int).
+        # Everything needed to REPLAY that round's inject at its own slots when it
+        # is backfilled lag_steps rounds later.
+        self._queue: dict = {}
 
     @property
     def enabled(self) -> bool:
@@ -41,57 +59,93 @@ class TargetHiddenLagCache:
     def lag_steps(self) -> int:
         return self._lag_steps
 
-    def snapshot(self, *, batch: ScheduleBatch, fresh_hidden: torch.Tensor) -> None:
-        """Step 2. Record this step's fresh target hidden for every request.
-
-        ``fresh_hidden`` is ``[bs, verify_num_draft_tokens, H]``; row ``i``
-        belongs to ``batch.reqs[i]``. Store a DETACHED CLONE of each row -- the
-        underlying capture buffer is reused by the next forward, so keeping a
-        view would alias and corrupt it (same reason ``write_target_hidden_kv``
-        treats ``ctx_hidden`` as read-only). Keep at most ``lag_steps + 1`` per
-        request; drop the oldest.
-
-        Q3 gate: what you key the store on is the whole question -- reason it
-        through before you implement (batch-row index vs request identity, under
-        reordering).
-        """
-        for req, target_hidden in zip(batch.reqs, fresh_hidden):
-            if req.rid not in self._store:
-                self._store[req.rid] = deque(maxlen=self._lag_steps + 1)
-            self._store[req.rid].append(target_hidden.detach().clone())
-
-    def get_lagged(
-        self, *, batch: ScheduleBatch, fresh_hidden: torch.Tensor
-    ) -> torch.Tensor:
-        """Step 2. Return a ``[bs, verify_num_draft_tokens, H]`` tensor whose row
-        ``i`` is the snapshot from ``lag_steps`` steps ago for ``batch.reqs[i]``
-        -- the caller injects it at THIS step's positions (value-stale).
-
-        Open sub-decisions to pin (part of Q3 / the mechanism to confirm with
-        zhendonghua before trusting any number):
-          - a request with fewer than ``lag_steps + 1`` snapshots (just joined)
-            has no lagged hidden -- fall back to fresh, or skip the request? Define it.
-          - "old value at current positions" (value-stale) vs "old value at old
-            positions" (positional-lag): the ByteDance design must confirm which.
-            This class only supplies the value; positions come from the caller.
-        """
-        lagged_rows = []
-        for req, fresh_row in zip(batch.reqs, fresh_hidden):
-            ring = self._store[req.rid]
-            if len(ring) < self._lag_steps + 1:
-                # Cold start: this request hasn't accumulated lag_steps+1
-                # snapshots yet, so no lag_steps-old hidden exists -> use fresh.
-                lagged_rows.append(fresh_row)
-            else:
-                # Ring holds the last lag_steps+1 snapshots oldest-first, so the
-                # oldest (index 0) is exactly the one from lag_steps steps ago.
-                lagged_rows.append(ring[0])
-        return torch.stack(lagged_rows, dim=0)
+    @property
+    def fill_mode(self) -> str:
+        return self._fill_mode
 
     def evict(self, *, rid: str) -> None:
-        """Step 2. Drop a finished request's snapshots. Called from
-        ``DSparkWorkerV2.note_request_finished``. Must be a no-op if ``rid`` is
-        absent (a request can finish without ever reaching commit_hidden)."""
-        if rid not in self._store:
-            return
-        del self._store[rid]
+        """Drop a finished request's queue. No-op if absent (a request can finish
+        without ever reaching commit_hidden)."""
+        self._queue.pop(rid, None)
+
+    def plan_step(
+        self,
+        *,
+        batch: ScheduleBatch,
+        fresh_hidden: torch.Tensor,  # [bs, W, H] this round's fresh target hidden
+        verify_cache_loc_2d: torch.Tensor,  # [bs, W]    per-position draft-KV slot
+        positions_2d: torch.Tensor,  # [bs, W]    per-position logical position
+        commit_lens: torch.Tensor,  # [bs]       accepted length per request
+    ) -> list[dict]:
+        """Return the ``inject_target_hidden(**kwargs)`` calls for THIS round: the
+        delayed BACKFILL (real hidden at its own old slots) + the FRONTIER FILL
+        (fill_mode at the current slots). Cold-start rounds inject fresh instead.
+
+        NOTE (assumption): a committed position's draft-KV slot is stable for the
+        life of the request, so backfilling to a slot recorded ``lag_steps`` rounds
+        ago lands on the same position. Holds for an active, un-preempted request
+        (the bs=1 ablation runs). Revisit for preemption / bs>1 keying."""
+        plans: list[dict] = []
+        for i, req in enumerate(batch.reqs):
+            q = self._queue.get(req.rid)
+            if q is None:
+                q = deque(maxlen=self._lag_steps + 1)
+                self._queue[req.rid] = q
+
+            h = (
+                fresh_hidden[i].detach().clone()
+            )  # [W, H] -- clone: capture buffer is reused
+            loc = verify_cache_loc_2d[i].clone()  # [W]
+            pos = positions_2d[i].clone()  # [W]
+            c_len = commit_lens[i : i + 1].clone()  # [1]
+            c_len_v = int(commit_lens[i])
+            q.append((h, loc, pos, c_len, c_len_v))
+
+            if len(q) < self._lag_steps + 1:
+                # cold start: no lag-old hidden yet -> inject fresh at current slots.
+                plans.append(self._inject(h, loc, pos, c_len))
+                continue
+
+            # steady state:
+            # (1) BACKFILL the block from lag_steps rounds ago at ITS OWN slots (real).
+            h_old, loc_old, pos_old, c_len_old, c_len_v_old = q[0]
+            plans.append(self._inject(h_old, loc_old, pos_old, c_len_old))
+            # (2) FILL the current frontier (transient; backfilled lag_steps rounds later).
+            fill = self._frontier_fill(
+                h_old=h_old, clen_old=c_len_v_old, width=h.shape[0]
+            )
+            plans.append(self._inject(fill, loc, pos, c_len))
+        return plans
+
+    def _frontier_fill(
+        self, *, h_old: torch.Tensor, c_len_v_old: int, width: int
+    ) -> torch.Tensor:
+        """[W, H] hidden to write at the current frontier slots (fill_mode)."""
+        if self._fill_mode == "repeat":
+            # last REAL verified position's hidden, broadcast across the frontier.
+            last_real = h_old[c_len_v_old - 1]  # [H]
+            return last_real.unsqueeze(0).repeat(width, 1)  # [W, H]
+        raise NotImplementedError(
+            f"fill_mode={self._fill_mode!r} not wired yet: 'gap' needs the draft "
+            f"attention to exclude un-injected slots (a masking change, not a skipped "
+            f"write); 'self_kv' needs the draft's own K/V, absent at this seam. Only "
+            f"'repeat' is implemented. See ssd-stale-poc/docs/design-options.md."
+        )
+
+    @staticmethod
+    def _inject(
+        hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> dict:
+        """kwargs for one TargetHiddenKvInjector.inject_target_hidden call (bs=1 shape)."""
+        return {
+            "target_hidden": hidden,  # [W, H]
+            "cache_loc": cache_loc,  # [W]
+            "cache_loc_2d": cache_loc.unsqueeze(
+                0
+            ),  # [1, W]  -> prefix-valid write path
+            "positions": positions,  # [W]
+            "commit_lens": commit_lens,  # [1]
+        }

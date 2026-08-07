@@ -314,19 +314,29 @@ class TargetVerifyExecutor:
         if hidden is None:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
-        if self._hidden_lag_cache.enabled:
-            # Stale-hidden ablation: swap the fresh target hidden for one lagged
-            # by lag_steps decode steps, injected at THIS step's positions
-            # (value-stale). No-op when disabled -> depth-0 parity.
-            self._hidden_lag_cache.snapshot(batch=batch, fresh_hidden=hidden)
-            hidden = self._hidden_lag_cache.get_lagged(batch=batch, fresh_hidden=hidden)
-        self.kv_injector.inject_target_hidden(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_window.verify_cache_loc,
-            cache_loc_2d=verify_window.verify_cache_loc_2d,
-            positions=verify_window.positions_2d.reshape(-1),
+        if not self._hidden_lag_cache.enabled:
+            # vanilla (lag=0): inject this round's fresh hidden immediately --
+            # byte-identical to stock DSpark.
+            self.kv_injector.inject_target_hidden(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=verify_window.verify_cache_loc,
+                cache_loc_2d=verify_window.verify_cache_loc_2d,
+                positions=verify_window.positions_2d.reshape(-1),
+                commit_lens=commit_lens,
+            )
+            return
+        # Stale-hidden ablation, variant C (lag>=1): faithful parallel = fresh BODY
+        # + transient FRONTIER hole. The cache emits, per round, the delayed
+        # BACKFILL (real hidden at its own old slots) plus the frontier FILL
+        # (fill_mode; overwritten by backfill lag_steps rounds later).
+        for inj in self._hidden_lag_cache.plan_step(
+            batch=batch,
+            fresh_hidden=hidden,
+            verify_cache_loc_2d=verify_window.verify_cache_loc_2d,
+            positions_2d=verify_window.positions_2d,
             commit_lens=commit_lens,
-        )
+        ):
+            self.kv_injector.inject_target_hidden(**inj)
 
     def _run_ragged(
         self,

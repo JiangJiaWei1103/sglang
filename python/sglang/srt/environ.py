@@ -914,6 +914,9 @@ class Envs:
     # steps (0 = fresh/vanilla) to measure accept-length drop under staleness
     # (parallel-DSpark go/no-go). Consumed by TargetHiddenLagCache.
     SGLANG_DSPARK_TARGET_HIDDEN_LAG_STEPS = EnvInt(0)
+    # Fill for the transient frontier hole when LAG_STEPS >= 1 (variant C):
+    # "repeat" (last real hidden), "gap", or "self_kv". See TargetHiddenLagCache.
+    SGLANG_DSPARK_STALE_FILL_MODE = EnvStr("repeat")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
