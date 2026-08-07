@@ -731,7 +731,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
-            new_seq_lens=accept.new_seq_lenscap_trim_lens,
+            new_seq_lens=accept.new_seq_lens,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
